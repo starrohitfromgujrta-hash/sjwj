@@ -113,7 +113,7 @@ TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"
 TOKEN_CACHE_TTL = 1200
 
-START_MATCH_INTERVAL = 1.5
+START_MATCH_INTERVAL = 1
 NEW_MATCH_DELAY = 1.0
 MAX_MATCH_DURATION = 700
 MATCH_IDLE_TIMEOUT = 8.0
@@ -129,8 +129,20 @@ FALLBACK_PASSWORD = ""
 
 CS_LOGIN_URL = "https://loginbp.ppmainecoonghj.com/"
 
+# 🔥 Speed tuning knobs
+LOGIN_CONCURRENCY = 50        # concurrent logins (lower to 50/30 if 429s appear)
+HTTP_MAX_CONNECTIONS = 2000
+HTTP_MAX_KEEPALIVE = 800
+DEVICES_FLUSH_INTERVAL = 5.0    # background devices.json flush cadence (sec)
+ACCOUNT_STAGGER_EVERY = 100     # yield event loop every N accounts
 
-# ==================== PERSISTENT DEVICE SYSTEM ====================
+
+# ==================== PERSISTENT DEVICE SYSTEM (IN-MEMORY) ====================
+_DEVICES_MEMO: Optional[Dict[str, dict]] = None
+_DEVICES_DIRTY: bool = False
+_DEVICES_LOCK = asyncio.Lock()
+
+
 def _generate_new_device() -> dict:
     device_list = [
         ("Samsung", "SM-G998B", "Adreno (TM) 660", "Android OS 12 / API-31"),
@@ -154,17 +166,52 @@ def _generate_new_device() -> dict:
     }
 
 
-def sync_devices_with_accounts() -> dict:
-    accounts = load_accounts()
-    devices = {}
+def _load_devices_cached() -> Dict[str, dict]:
+    """Load devices.json once into memory; subsequent calls are O(1)."""
+    global _DEVICES_MEMO
+    if _DEVICES_MEMO is not None:
+        return _DEVICES_MEMO
     if os.path.exists(DEVICES_FILE):
         try:
             with open(DEVICES_FILE, "r", encoding="utf-8") as f:
-                devices = json.load(f)
-                if not isinstance(devices, dict):
-                    devices = {}
+                data = json.load(f)
+                _DEVICES_MEMO = data if isinstance(data, dict) else {}
         except Exception:
-            devices = {}
+            _DEVICES_MEMO = {}
+    else:
+        _DEVICES_MEMO = {}
+    return _DEVICES_MEMO
+
+
+def _flush_devices(force: bool = False):
+    """Atomic write devices memo back to disk (only if dirty)."""
+    global _DEVICES_DIRTY
+    if _DEVICES_MEMO is None:
+        return
+    if not _DEVICES_DIRTY and not force:
+        return
+    try:
+        tmp = DEVICES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_DEVICES_MEMO, f, indent=2)
+        os.replace(tmp, DEVICES_FILE)
+        _DEVICES_DIRTY = False
+    except Exception as e:
+        print_error(f"devices flush error: {e}")
+
+
+async def _devices_flusher():
+    """Background task — periodically persists device map."""
+    while True:
+        await asyncio.sleep(DEVICES_FLUSH_INTERVAL)
+        _flush_devices()
+
+
+def sync_devices_with_accounts() -> dict:
+    """Ensure every account has a device entry (in-memory only; flush in bg)."""
+    global _DEVICES_DIRTY
+    accounts = load_accounts()
+    devices = _load_devices_cached()
 
     cached_data = _load_token_cache()
     synced_devices = {}
@@ -202,27 +249,22 @@ def sync_devices_with_accounts() -> dict:
             dev_profile = devices[acc_key]
         if not dev_profile:
             dev_profile = _generate_new_device()
+            _DEVICES_DIRTY = True
         synced_devices[acc_key] = dev_profile
 
-    try:
-        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(synced_devices, f, indent=4)
-    except Exception as e:
-        print_error(f"Failed to save synced devices: {e}")
+    # Persist any newly-added entries (in-memory + async flush)
+    for k, v in synced_devices.items():
+        if k not in devices:
+            devices[k] = v
+            _DEVICES_DIRTY = True
 
     return synced_devices
 
 
 def get_device_for_account(account_identifier: str) -> dict:
-    devices = {}
-    if os.path.exists(DEVICES_FILE):
-        try:
-            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
-                devices = json.load(f)
-                if not isinstance(devices, dict):
-                    devices = {}
-        except Exception:
-            devices = {}
+    """Fast in-memory lookup; aliases migrated lazily."""
+    global _DEVICES_DIRTY
+    devices = _load_devices_cached()
 
     acc_key = str(account_identifier).strip()
     if acc_key in devices:
@@ -233,21 +275,12 @@ def get_device_for_account(account_identifier: str) -> dict:
         if alias and str(alias) in devices:
             dev = devices.pop(str(alias))
             devices[acc_key] = dev
-            try:
-                with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-                    json.dump(devices, f, indent=4)
-            except Exception:
-                pass
+            _DEVICES_DIRTY = True
             return dev
 
     new_device = _generate_new_device()
     devices[acc_key] = new_device
-    try:
-        with open(DEVICES_FILE, "w", encoding="utf-8") as f:
-            json.dump(devices, f, indent=4)
-    except Exception as e:
-        print_error(f"Failed to save device mapping: {e}")
-
+    _DEVICES_DIRTY = True
     return new_device
 
 
@@ -374,9 +407,15 @@ def optimize_udp_socket(sock: socket.socket):
 client = httpx.AsyncClient(
     verify=False,
     timeout=15.0,
-    limits=httpx.Limits(max_connections=500, max_keepalive_connections=200)
+    limits=httpx.Limits(
+        max_connections=HTTP_MAX_CONNECTIONS,
+        max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+        keepalive_expiry=30.0
+    )
 )
-_LOGIN_SEMAPHORE = asyncio.Semaphore(4)
+
+# 🔥 High-concurrency login semaphore
+_LOGIN_SEMAPHORE = asyncio.Semaphore(LOGIN_CONCURRENCY)
 
 AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
@@ -495,7 +534,7 @@ async def _get_match_count(uid: str) -> int:
         return _match_counters.get(uid, 0)
 
 
-# ==================== TOKEN CACHE ====================
+# ==================== TOKEN CACHE (UNCHANGED - original behaviour) ====================
 _token_cache_memo: Dict[str, Any] = {}
 _token_cache_memo_time: float = 0.0
 _TOKEN_CACHE_MEMO_TTL = 5.0
@@ -2056,16 +2095,31 @@ def load_accounts():
     return accounts
 
 
+async def _warmup_dns():
+    """Pre-warm DNS cache so first logins don't block on resolution."""
+    hosts = [
+        "loginbp.ppmainecoonghj.com",
+        "100067.connect.garena.com",
+        "version.ggwhitehawk.com",
+    ]
+    await asyncio.gather(*[resolve_host_cloudflare(h) for h in hosts],
+                         return_exceptions=True)
+
+
 async def main():
     print_colored("╔════════════════════════════════════════════════════════════╗", Colors.CYAN)
     print_colored(f"║  ⚡ Lvl 2 = BR | Lvl 3+ = LONE WOLF — Background UDP ⚡      ║", Colors.CYAN)
     print_colored(f"║  Web Dashboard: http://localhost:{WEB_PORT}                     ║", Colors.WHITE)
+    print_colored(f"║  🚀 Fast-Load Mode: {LOGIN_CONCURRENCY} concurrent logins      ║", Colors.GREEN)
     print_colored("╚════════════════════════════════════════════════════════════╝", Colors.CYAN)
 
     if not (_ok_eq and _ok_es and _ok_pt):
         print_error("⚠️  Some CS.py proto files MISSING — check Pb2/ folder")
     if _START_MATCH_CLS is None:
         print_error("⚠️  StartMatch class not found in StartMatch_pb2!")
+
+    # 🔥 Background devices flusher
+    asyncio.create_task(_devices_flusher())
 
     try:
         await start_web_dashboard(host=WEB_HOST, port=WEB_PORT)
@@ -2074,7 +2128,7 @@ async def main():
         print_error(f"Could not start web dashboard: {e}")
 
     async def on_account_added_handler(data):
-        sync_devices_with_accounts()
+        # 🔥 No full re-sync — flusher handles persistence in background
         if "token" in data and data["token"]:
             t = str(data["token"]).strip()
             task = asyncio.create_task(account_loop_token(t))
@@ -2112,6 +2166,7 @@ async def main():
         for d_id in deleted_ids:
             cache_invalidate(str(d_id))
         sync_devices_with_accounts()
+        _flush_devices(force=True)
 
     async def on_pause_toggle_handler(uid, is_paused):
         if is_paused:
@@ -2123,25 +2178,41 @@ async def main():
     bot_state.refresh_callbacks["on_restart_account"] = on_restart_account_handler
     bot_state.refresh_callbacks["on_pause_toggle"] = on_pause_toggle_handler
 
+    # 🔥 One-time devices sync (in-memory only)
     sync_devices_with_accounts()
+
+    # 🔥 DNS warmup (parallel)
+    print_info("[DNS] Warming up...")
+    await _warmup_dns()
+    print_success("[DNS] Warmup complete")
+
     accounts = load_accounts()
 
     if not accounts:
         print_warning(f"[!] No accounts found in {ACCOUNTS_FILE}. Add via Dashboard.")
     else:
-        print_success(f"[✓] Loaded {len(accounts)} accounts")
+        print_success(f"[✓] Loaded {len(accounts)} accounts — spawning workers...")
+        t0 = time.time()
+        spawned = 0
 
-    for idx, acc in enumerate(accounts):
-        if "token" in acc and acc["token"]:
-            tok = str(acc["token"]).strip()
-            t = asyncio.create_task(account_loop_token(tok))
-            bot_state.account_workers[tok[:16]] = t
-        elif "uid" in acc and "password" in acc and acc["uid"]:
-            u = str(acc["uid"])
-            t = asyncio.create_task(account_loop_guest(u, acc["password"]))
-            bot_state.account_workers[u] = t
-        if idx < len(accounts) - 1:
-            await asyncio.sleep(0.35)
+        for idx, acc in enumerate(accounts):
+            if "token" in acc and acc["token"]:
+                tok = str(acc["token"]).strip()
+                t = asyncio.create_task(account_loop_token(tok))
+                bot_state.account_workers[tok[:16]] = t
+                spawned += 1
+            elif "uid" in acc and "password" in acc and acc["uid"]:
+                u = str(acc["uid"])
+                t = asyncio.create_task(account_loop_guest(u, acc["password"]))
+                bot_state.account_workers[u] = t
+                spawned += 1
+
+            # 🔥 Only yield the event loop — no artificial delay
+            if idx % ACCOUNT_STAGGER_EVERY == ACCOUNT_STAGGER_EVERY - 1:
+                await asyncio.sleep(0)
+
+        elapsed = time.time() - t0
+        print_success(f"[✓] {spawned} workers spawned in {elapsed:.2f}s (concurrency={LOGIN_CONCURRENCY})")
 
     try:
         while True:
@@ -2151,6 +2222,7 @@ async def main():
         for t in list(bot_state.account_workers.values()):
             t.cancel()
         await asyncio.gather(*bot_state.account_workers.values(), return_exceptions=True)
+        _flush_devices(force=True)
         print_success("All sessions closed.")
 
 
